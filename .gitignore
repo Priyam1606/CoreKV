@@ -1,0 +1,5 @@
+out/
+data/
+
+# Keep the directory structure if needed
+!data/.gitkeep
