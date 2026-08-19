@@ -98,7 +98,7 @@ public class Trie {
             output.add(builder.toString());
         }
 
-        for (CustomHashTable.Entry<Character, TrieNode> entry : node.children.entries()) {
+        for (CustomHashTable.Entry<Character, TrieNode> entry : node.children) {
             builder.append(entry.key());
             collect(entry.value(), builder, output);
             builder.deleteCharAt(builder.length() - 1);

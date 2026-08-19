@@ -1,7 +1,6 @@
 package corekv;
 
 import corekv.cache.LruCache;
-import corekv.hash.CustomHashTable;
 import corekv.trie.Trie;
 import corekv.wal.WalRecord;
 import corekv.wal.WriteAheadLog;
@@ -11,16 +10,20 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+/**
+ * The LRU cache IS the store: once the number of keys exceeds {@code capacity},
+ * the least-recently-used key/value is evicted, along with its trie entry and a
+ * matching WAL delete record. {@code get} counts as a use and refreshes recency,
+ * so it takes the write lock rather than the read lock.
+ */
 public class CoreKVStore {
-    private final CustomHashTable<String, String> storage;
-    private final LruCache<String, String> cache;
+    private final LruCache<String, String> store;
     private final Trie trie;
     private final WriteAheadLog wal;
     private final ReentrantReadWriteLock lock;
 
-    public CoreKVStore(int initialCapacity, int cacheCapacity, Path walPath) throws IOException {
-        this.storage = new CustomHashTable<>(initialCapacity, 0.75);
-        this.cache = new LruCache<>(cacheCapacity);
+    public CoreKVStore(int capacity, Path walPath) throws IOException {
+        this.store = new LruCache<>(capacity);
         this.trie = new Trie();
         this.wal = new WriteAheadLog(walPath);
         this.lock = new ReentrantReadWriteLock();
@@ -28,24 +31,15 @@ public class CoreKVStore {
     }
 
     public String get(String key) {
-        lock.readLock().lock();
+        lock.writeLock().lock();
         try {
-            String cached = cache.peek(key);
-            if (cached != null) {
-                return refreshCacheEntry(key, cached);
-            }
-
-            String value = storage.get(key);
-            if (value == null) {
-                return null;
-            }
-            return refreshCacheEntry(key, value);
+            return store.get(key);
         } finally {
-            lock.readLock().unlock();
+            lock.writeLock().unlock();
         }
     }
 
-    public String put(String key, String value) throws IOException {
+    public PutResult put(String key, String value) throws IOException {
         validateKey(key);
         validateValue(value);
         lock.writeLock().lock();
@@ -71,7 +65,7 @@ public class CoreKVStore {
     public boolean containsKey(String key) {
         lock.readLock().lock();
         try {
-            return storage.containsKey(key);
+            return store.containsKey(key);
         } finally {
             lock.readLock().unlock();
         }
@@ -86,10 +80,10 @@ public class CoreKVStore {
         }
     }
 
-    public List<CustomHashTable.Entry<String, String>> snapshot() {
+    public List<LruCache.Entry<String, String>> snapshot() {
         lock.readLock().lock();
         try {
-            return storage.entries();
+            return store.entries();
         } finally {
             lock.readLock().unlock();
         }
@@ -98,7 +92,7 @@ public class CoreKVStore {
     public int size() {
         lock.readLock().lock();
         try {
-            return storage.size();
+            return store.size();
         } finally {
             lock.readLock().unlock();
         }
@@ -107,8 +101,7 @@ public class CoreKVStore {
     public void clear() throws IOException {
         lock.writeLock().lock();
         try {
-            storage.clear();
-            cache.clear();
+            store.clear();
             trie.clear();
             wal.clear();
         } finally {
@@ -120,38 +113,21 @@ public class CoreKVStore {
         return wal.path();
     }
 
-    private String refreshCacheEntry(String key, String fallbackValue) {
-        lock.readLock().unlock();
-        lock.writeLock().lock();
-        try {
-            String cached = cache.get(key);
-            if (cached != null) {
-                return cached;
-            }
-            String current = storage.get(key);
-            if (current == null) {
-                return null;
-            }
-            cache.put(key, current);
-            return current;
-        } finally {
-            lock.readLock().lock();
-            lock.writeLock().unlock();
-        }
-    }
-
-    private String applyPut(String key, String value) {
-        String previous = storage.put(key, value);
+    private PutResult applyPut(String key, String value) throws IOException {
+        LruCache.PutOutcome<String, String> outcome = store.put(key, value);
         trie.insert(key);
-        cache.put(key, value);
-        return previous;
+        if (outcome.evicted()) {
+            trie.remove(outcome.evictedKey());
+            wal.appendDelete(outcome.evictedKey());
+            return new PutResult(outcome.previousValue(), outcome.evictedKey());
+        }
+        return new PutResult(outcome.previousValue(), null);
     }
 
     private String applyDelete(String key) {
-        String removed = storage.remove(key);
+        String removed = store.remove(key);
         if (removed != null) {
             trie.remove(key);
-            cache.remove(key);
         }
         return removed;
     }
@@ -180,6 +156,29 @@ public class CoreKVStore {
     private void validateValue(String value) {
         if (value == null) {
             throw new IllegalArgumentException("Value must not be null.");
+        }
+    }
+
+    /** Outcome of a {@link #put(String, String)}: the prior value, and which key (if any) was evicted to make room. */
+    public static final class PutResult {
+        private final String previousValue;
+        private final String evictedKey;
+
+        private PutResult(String previousValue, String evictedKey) {
+            this.previousValue = previousValue;
+            this.evictedKey = evictedKey;
+        }
+
+        public String previousValue() {
+            return previousValue;
+        }
+
+        public boolean evicted() {
+            return evictedKey != null;
+        }
+
+        public String evictedKey() {
+            return evictedKey;
         }
     }
 }

@@ -1,6 +1,6 @@
 package corekv;
 
-import corekv.hash.CustomHashTable;
+import corekv.cache.LruCache;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -14,8 +14,7 @@ import java.util.Scanner;
 import java.util.stream.Stream;
 
 public class Main {
-    private static final int DEFAULT_INITIAL_CAPACITY = 16;
-    private static final int DEFAULT_CACHE_CAPACITY = 3;
+    private static final int DEFAULT_STORE_CAPACITY = 16;
     private static final int SIMULATION_PREFIX_BUCKETS = 1_000;
     private static final String[] FIRST_NAMES = {
         "priyam", "arush", "riya", "kabir", "anaya", "vivaan", "diya", "aditya",
@@ -35,22 +34,21 @@ public class Main {
         }
 
         if (args.length > 0 && "auto-demo".equalsIgnoreCase(args[0])) {
-            CoreKVStore store = createDefaultStore();
+            CoreKVStore store = createStore(DEFAULT_STORE_CAPACITY);
             runDynamicDemo(store);
             return;
         }
 
-        CoreKVStore store = createDefaultStore();
         if (args.length > 0 && "repl".equalsIgnoreCase(args[0])) {
-            runRepl(store);
+            runRepl();
             return;
         }
 
-        runGuidedDemo(store);
+        runGuidedDemo();
     }
 
-    private static CoreKVStore createDefaultStore() throws IOException {
-        return new CoreKVStore(DEFAULT_INITIAL_CAPACITY, DEFAULT_CACHE_CAPACITY, Path.of("data", "corekv.wal"));
+    private static CoreKVStore createStore(int capacity) throws IOException {
+        return new CoreKVStore(capacity, Path.of("data", "corekv.wal"));
     }
 
     private static void runDynamicDemo(CoreKVStore store) throws IOException {
@@ -97,14 +95,20 @@ public class Main {
         System.out.println("Run with `java -cp out/main corekv.Main repl` for interactive mode.");
     }
 
-    private static void runRepl(CoreKVStore store) throws IOException {
+    private static void runRepl() throws IOException {
         try (Scanner scanner = new Scanner(System.in)) {
-            System.out.println("CoreKV REPL");
-            System.out.println("Commands: put <key> <value>, get <key>, delete <key>, prefix <prefix>, size, show, clear, exit");
+            printBanner();
+            System.out.print("Enter store capacity (max keys before LRU eviction kicks in): ");
+            int capacity = readPositiveInt(scanner);
+            CoreKVStore store = createStore(capacity);
+            store.clear(); // fresh session: don't inherit data left over from a previous run
+            System.out.println("WAL file: " + store.walPath().toAbsolutePath());
+            printHelp();
 
             while (true) {
                 System.out.print("> ");
                 if (!scanner.hasNextLine()) {
+                    endSession(store);
                     return;
                 }
 
@@ -113,6 +117,7 @@ public class Main {
                     continue;
                 }
                 if ("exit".equalsIgnoreCase(line)) {
+                    endSession(store);
                     return;
                 }
 
@@ -122,8 +127,7 @@ public class Main {
                 switch (command) {
                     case "put" -> {
                         requireArguments(parts, 3);
-                        store.put(parts[1], parts[2]);
-                        System.out.println("OK");
+                        reportPut(store.put(parts[1], parts[2]));
                     }
                     case "get" -> {
                         requireArguments(parts, 2);
@@ -140,11 +144,12 @@ public class Main {
                     }
                     case "size" -> System.out.println(store.size());
                     case "show" -> System.out.println(formatSnapshot(store.snapshot()));
+                    case "help" -> printHelp();
                     case "clear" -> {
                         store.clear();
                         System.out.println("Store cleared.");
                     }
-                    default -> System.out.println("Unknown command.");
+                    default -> System.out.println("Unknown command. Type 'help' to see the command list.");
                 }
             }
         }
@@ -169,7 +174,10 @@ public class Main {
             String runId = Long.toUnsignedString(Instant.now().toEpochMilli());
             Path walPath = Path.of("data", "simulation-check.wal");
             Path sheetPath = Path.of("data", "simulation-check-" + runId + ".csv");
-            CoreKVStore store = new CoreKVStore(DEFAULT_INITIAL_CAPACITY, Math.max(DEFAULT_CACHE_CAPACITY, 1_024), walPath);
+            // Sized to the requested count so the LRU cap never evicts rows the
+            // verification sheet expects to still be readable back.
+            int simulationCapacity = (int) Math.min(count, Integer.MAX_VALUE - 8);
+            CoreKVStore store = new CoreKVStore(Math.max(simulationCapacity, 1), walPath);
             store.clear();
 
             long startedAt = System.currentTimeMillis();
@@ -232,9 +240,13 @@ public class Main {
         }
     }
 
-    private static void runGuidedDemo(CoreKVStore store) throws IOException {
+    private static void runGuidedDemo() throws IOException {
         try (Scanner scanner = new Scanner(System.in)) {
-            System.out.println("CoreKV guided demo");
+            printBanner();
+            System.out.print("Enter store capacity (max keys before LRU eviction kicks in): ");
+            int capacity = readPositiveInt(scanner);
+            CoreKVStore store = createStore(capacity);
+            store.clear(); // fresh session: don't inherit data left over from a previous run
             System.out.println("WAL file: " + store.walPath().toAbsolutePath());
             System.out.print("How many key-value pairs do you want to insert? ");
 
@@ -244,16 +256,18 @@ public class Main {
                 String key = readNonBlankLine(scanner);
                 System.out.print("Enter value for " + key + ": ");
                 String value = scanner.nextLine();
-                store.put(key, value);
-                System.out.println("Stored -> " + key + "=" + value);
+                CoreKVStore.PutResult result = store.put(key, value);
+                String suffix = result.evicted() ? " (evicted least-recently-used key: " + result.evictedKey() + ")" : "";
+                System.out.println("Stored -> " + key + "=" + value + suffix);
             }
 
             System.out.println("Initial load complete. You can now query the store.");
-            System.out.println("Commands: get <key>, prefix <prefix>, delete <key>, put <key> <value>, size, show, clear, exit");
+            printHelp();
 
             while (true) {
                 System.out.print("> ");
                 if (!scanner.hasNextLine()) {
+                    endSession(store);
                     return;
                 }
 
@@ -262,6 +276,7 @@ public class Main {
                     continue;
                 }
                 if ("exit".equalsIgnoreCase(line)) {
+                    endSession(store);
                     return;
                 }
 
@@ -271,8 +286,7 @@ public class Main {
                 switch (command) {
                     case "put" -> {
                         requireArguments(parts, 3);
-                        store.put(parts[1], parts[2]);
-                        System.out.println("OK");
+                        reportPut(store.put(parts[1], parts[2]));
                     }
                     case "get" -> {
                         requireArguments(parts, 2);
@@ -288,20 +302,53 @@ public class Main {
                     }
                     case "size" -> System.out.println(store.size());
                     case "show" -> System.out.println(formatSnapshot(store.snapshot()));
+                    case "help" -> printHelp();
                     case "clear" -> {
                         store.clear();
                         System.out.println("Store cleared.");
                     }
-                    default -> System.out.println("Unknown command.");
+                    default -> System.out.println("Unknown command. Type 'help' to see the command list.");
                 }
             }
         }
     }
 
-    private static String formatSnapshot(List<CustomHashTable.Entry<String, String>> entries) {
+    private static void printBanner() {
+        System.out.println("========================================");
+        System.out.println("  CoreKV -- hand-built key-value store");
+        System.out.println("========================================");
+    }
+
+    private static void printHelp() {
+        System.out.println("Commands:");
+        System.out.println("  put <key> <value>   store or update a value");
+        System.out.println("  get <key>           fetch a value (marks it most recently used)");
+        System.out.println("  delete <key>        remove a key");
+        System.out.println("  prefix <prefix>     list all keys starting with prefix");
+        System.out.println("  size                number of keys currently stored");
+        System.out.println("  show                snapshot, most-recently-used first");
+        System.out.println("  help                show this list again");
+        System.out.println("  clear               wipe all data (including the WAL)");
+        System.out.println("  exit                quit");
+    }
+
+    private static void endSession(CoreKVStore store) throws IOException {
+        store.clear();
+        System.out.println("Session ended -- store cleared.");
+    }
+
+    private static void reportPut(CoreKVStore.PutResult result) {
+        if (result.evicted()) {
+            System.out.println("OK (capacity reached -> evicted least-recently-used key: " + result.evictedKey() + ")");
+        } else {
+            System.out.println("OK");
+        }
+    }
+
+    private static String formatSnapshot(List<LruCache.Entry<String, String>> entries) {
         StringBuilder builder = new StringBuilder("[");
         for (int i = 0; i < entries.size(); i++) {
-            CustomHashTable.Entry<String, String> entry = entries.get(i);
+            LruCache.Entry<String, String> entry = entries.get(i);
             builder.append(entry.key()).append("=").append(entry.value());
             if (i < entries.size() - 1) {
                 builder.append(", ");

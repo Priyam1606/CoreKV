@@ -1,16 +1,30 @@
 package corekv.hash;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 
-public class CustomHashTable<K, V> {
+/**
+ * A hash table with separate chaining, dynamic resizing, and an intrusive
+ * doubly linked list threaded through every live entry (the same technique
+ * {@code java.util.LinkedHashMap} uses). The linked list means iterating all
+ * entries costs O(size), not O(bucket array length) — a plain array scan
+ * would waste work on empty buckets, which matters here because this table
+ * also backs sparse structures like a trie node's children.
+ */
+public class CustomHashTable<K, V> implements Iterable<CustomHashTable.Entry<K, V>> {
     private static final int DEFAULT_CAPACITY = 16;
     private static final double DEFAULT_LOAD_FACTOR = 0.75;
+    private static final int FNV_OFFSET_BASIS = 0x811C9DC5;
+    private static final int FNV_PRIME = 0x01000193;
 
     private final double loadFactorThreshold;
     private Node<K, V>[] buckets;
     private int size;
+    private Node<K, V> head;
+    private Node<K, V> tail;
 
     @SuppressWarnings("unchecked")
     public CustomHashTable() {
@@ -52,7 +66,9 @@ public class CustomHashTable<K, V> {
             current = current.next;
         }
 
-        buckets[index] = new Node<>(key, value, buckets[index]);
+        Node<K, V> node = new Node<>(key, value, buckets[index]);
+        buckets[index] = node;
+        linkAtTail(node);
         size++;
         return null;
     }
@@ -68,6 +84,7 @@ public class CustomHashTable<K, V> {
                 } else {
                     previous.next = current.next;
                 }
+                unlink(current);
                 size--;
                 return current.value;
             }
@@ -89,18 +106,39 @@ public class CustomHashTable<K, V> {
     public void clear() {
         buckets = (Node<K, V>[]) new Node[buckets.length];
         size = 0;
+        head = null;
+        tail = null;
     }
 
+    /** O(size): walks the linked list, never the (possibly much larger) bucket array. */
     public List<Entry<K, V>> entries() {
         List<Entry<K, V>> result = new ArrayList<>(size);
-        for (Node<K, V> bucket : buckets) {
-            Node<K, V> current = bucket;
-            while (current != null) {
-                result.add(new Entry<>(current.key, current.value));
-                current = current.next;
-            }
+        for (Entry<K, V> entry : this) {
+            result.add(entry);
         }
         return result;
+    }
+
+    @Override
+    public Iterator<Entry<K, V>> iterator() {
+        return new Iterator<>() {
+            private Node<K, V> current = head;
+
+            @Override
+            public boolean hasNext() {
+                return current != null;
+            }
+
+            @Override
+            public Entry<K, V> next() {
+                if (current == null) {
+                    throw new NoSuchElementException();
+                }
+                Entry<K, V> entry = new Entry<>(current.key, current.value);
+                current = current.after;
+                return entry;
+            }
+        };
     }
 
     private Node<K, V> findNode(K key) {
@@ -122,23 +160,100 @@ public class CustomHashTable<K, V> {
         }
     }
 
+    /**
+     * Doubles the bucket array and re-buckets existing nodes in place: each node
+     * keeps its identity (and therefore its linked-list position), only its
+     * bucket-chain pointer is rewired. This is O(size) with no rehash lookups or
+     * reinsertion overhead, unlike routing every entry back through {@link #put}.
+     */
     @SuppressWarnings("unchecked")
     private void resize() {
         Node<K, V>[] oldBuckets = buckets;
-        buckets = (Node<K, V>[]) new Node[oldBuckets.length * 2];
-        size = 0;
+        Node<K, V>[] newBuckets = (Node<K, V>[]) new Node[oldBuckets.length * 2];
 
         for (Node<K, V> bucket : oldBuckets) {
             Node<K, V> current = bucket;
             while (current != null) {
-                put(current.key, current.value);
-                current = current.next;
+                Node<K, V> next = current.next;
+                int index = bucketIndex(current.key, newBuckets.length);
+                current.next = newBuckets[index];
+                newBuckets[index] = current;
+                current = next;
             }
+        }
+
+        buckets = newBuckets;
+    }
+
+    private void linkAtTail(Node<K, V> node) {
+        node.before = tail;
+        node.after = null;
+        if (tail != null) {
+            tail.after = node;
+        }
+        tail = node;
+        if (head == null) {
+            head = node;
         }
     }
 
+    private void unlink(Node<K, V> node) {
+        if (node.before != null) {
+            node.before.after = node.after;
+        } else {
+            head = node.after;
+        }
+        if (node.after != null) {
+            node.after.before = node.before;
+        } else {
+            tail = node.before;
+        }
+        node.before = null;
+        node.after = null;
+    }
+
     private int bucketIndex(K key, int length) {
-        return Math.floorMod(key == null ? 0 : key.hashCode(), length);
+        return Math.floorMod(key == null ? 0 : spread(rawHash(key)), length);
+    }
+
+    /**
+     * Computes the raw hash for a key. CoreKV's keys are strings, so this table
+     * hashes them itself (FNV-1a) instead of delegating to {@code String.hashCode()}.
+     * Any other key type (e.g. {@code Character} for trie children) falls back to
+     * {@code hashCode()}, since this table is still generic and can't hand-hash a
+     * type it knows nothing about.
+     */
+    private int rawHash(K key) {
+        if (key instanceof String stringKey) {
+            return fnv1aHash(stringKey);
+        }
+        return key.hashCode();
+    }
+
+    /**
+     * FNV-1a: walk the characters, XOR each one in, multiply by a fixed prime.
+     * Simple, well-distributed, and a genuinely from-scratch hash function rather
+     * than a borrowed one — chosen over the polynomial scheme
+     * {@code String.hashCode()} uses specifically so this isn't the same formula
+     * with different constants.
+     */
+    private static int fnv1aHash(String value) {
+        int hash = FNV_OFFSET_BASIS;
+        for (int i = 0; i < value.length(); i++) {
+            hash ^= value.charAt(i);
+            hash *= FNV_PRIME;
+        }
+        return hash;
+    }
+
+    /**
+     * Folds the high bits of a hash code into the low bits, the same trick
+     * {@code java.util.HashMap} uses, so that hash codes differing mainly in
+     * their upper bits still spread across a small bucket array instead of
+     * colliding.
+     */
+    private static int spread(int hash) {
+        return hash ^ (hash >>> 16);
     }
 
     private int tableSizeFor(int requestedCapacity) {
@@ -171,6 +286,8 @@ public class CustomHashTable<K, V> {
         private final K key;
         private V value;
         private Node<K, V> next;
+        private Node<K, V> before;
+        private Node<K, V> after;
 
         private Node(K key, V value, Node<K, V> next) {
             this.key = key;

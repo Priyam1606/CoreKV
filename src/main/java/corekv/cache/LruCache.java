@@ -17,7 +17,7 @@ public class LruCache<K, V> {
             throw new IllegalArgumentException("Capacity must be positive.");
         }
         this.capacity = capacity;
-        this.index = new CustomHashTable<>();
+        this.index = new CustomHashTable<>(capacity, 0.75);
     }
 
     public V get(K key) {
@@ -34,12 +34,18 @@ public class LruCache<K, V> {
         return node == null ? null : node.value;
     }
 
-    public void put(K key, V value) {
+    /**
+     * Inserts or updates a key. If the update pushes the cache past capacity,
+     * the least-recently-used entry is evicted and reported on the returned
+     * outcome so the caller can keep other structures (indexes, logs) in sync.
+     */
+    public PutOutcome<K, V> put(K key, V value) {
         Node<K, V> existing = index.get(key);
         if (existing != null) {
+            V previous = existing.value;
             existing.value = value;
             moveToFront(existing);
-            return;
+            return new PutOutcome<>(previous, null, null);
         }
 
         Node<K, V> node = new Node<>(key, value);
@@ -48,8 +54,10 @@ public class LruCache<K, V> {
         size++;
 
         if (size > capacity) {
-            evictLeastRecentlyUsed();
+            Entry<K, V> evicted = evictLeastRecentlyUsed();
+            return new PutOutcome<>(null, evicted.key(), evicted.value());
         }
+        return new PutOutcome<>(null, null, null);
     }
 
     public V remove(K key) {
@@ -87,14 +95,23 @@ public class LruCache<K, V> {
         return keys;
     }
 
-    private void evictLeastRecentlyUsed() {
-        if (tail == null) {
-            return;
+    /** Returns entries ordered from most-recently-used to least-recently-used. */
+    public List<Entry<K, V>> entries() {
+        List<Entry<K, V>> result = new ArrayList<>(size);
+        Node<K, V> current = head;
+        while (current != null) {
+            result.add(new Entry<>(current.key, current.value));
+            current = current.next;
         }
-        K keyToRemove = tail.key;
+        return result;
+    }
+
+    private Entry<K, V> evictLeastRecentlyUsed() {
+        Entry<K, V> evicted = new Entry<>(tail.key, tail.value);
         detach(tail);
-        index.remove(keyToRemove);
+        index.remove(evicted.key());
         size--;
+        return evicted;
     }
 
     private void moveToFront(Node<K, V> node) {
@@ -141,6 +158,58 @@ public class LruCache<K, V> {
         private Node(K key, V value) {
             this.key = key;
             this.value = value;
+        }
+    }
+
+    public static final class Entry<K, V> {
+        private final K key;
+        private final V value;
+
+        public Entry(K key, V value) {
+            this.key = key;
+            this.value = value;
+        }
+
+        public K key() {
+            return key;
+        }
+
+        public V value() {
+            return value;
+        }
+    }
+
+    /**
+     * Result of a {@link #put(Object, Object)} call: the previous value for the key
+     * (if it was already present), and the key/value that got evicted to make room
+     * (if the cache was over capacity). At most one of "previous value" and
+     * "eviction" applies to a single put, since an update never triggers eviction.
+     */
+    public static final class PutOutcome<K, V> {
+        private final V previousValue;
+        private final K evictedKey;
+        private final V evictedValue;
+
+        private PutOutcome(V previousValue, K evictedKey, V evictedValue) {
+            this.previousValue = previousValue;
+            this.evictedKey = evictedKey;
+            this.evictedValue = evictedValue;
+        }
+
+        public V previousValue() {
+            return previousValue;
+        }
+
+        public boolean evicted() {
+            return evictedKey != null;
+        }
+
+        public K evictedKey() {
+            return evictedKey;
+        }
+
+        public V evictedValue() {
+            return evictedValue;
         }
     }
 }
